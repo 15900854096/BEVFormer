@@ -63,6 +63,9 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
         self.return_intermediate = return_intermediate
         self.fp16_enabled = False
 
+    # 循环进入 6 个相同的 DetrTransformerDecoderLayer，
+    # 一个 DetrTransformerDecoderLayer 包含 ('self_attn', 'norm', 'cross_attn', 'norm', 'ffn', 'norm')，每层输出 output 和reference_points；
+    # 在 6 层 DetrTransformerDecoderLayer 遍历完成后，将 6 层输出的 output 和reference_points 输出。
     def forward(self,
                 query,
                 *args,
@@ -87,26 +90,33 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
                 return_intermediate is `False`, otherwise it has shape
                 [num_layers, num_query, bs, embed_dims].
         """
+        #output：torch.Size([900, 1, 256])
         output = query
         intermediate = []
         intermediate_reference_points = []
+        #循环进入6个相同的DetrTransformerDecoderLayer模块
         for lid, layer in enumerate(self.layers):
-
+            #reference_points_input：torch.Size([1, 900, 1, 2])
+            #该reference_points在decoder中的CustimMSDeformableAttention作为融合bev_embed的基准采样点
             reference_points_input = reference_points[..., :2].unsqueeze(
                 2)  # BS NUM_QUERY NUM_LEVEL 2
+            #进入某一层DetrTransformerDecoderLayer
             output = layer(
                 output,
                 *args,
                 reference_points=reference_points_input,
                 key_padding_mask=key_padding_mask,
                 **kwargs)
+            #output:torch.Size([1, 900, 256])
             output = output.permute(1, 0, 2)
 
             if reg_branches is not None:
+                #tmp:torch.Size([1, 900, 10])
                 tmp = reg_branches[lid](output)
 
                 assert reference_points.shape[-1] == 3
-
+                #new_reference_pointtorch.Size([1, 900, 3])
+                #每一层都更新参考点
                 new_reference_points = torch.zeros_like(reference_points)
                 new_reference_points[..., :2] = tmp[
                     ..., :2] + inverse_sigmoid(reference_points[..., :2])
@@ -115,13 +125,13 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
 
                 new_reference_points = new_reference_points.sigmoid()
 
-                reference_points = new_reference_points.detach()
+                reference_points = new_reference_points.detach() #不会参与output有关的梯度计算
 
             output = output.permute(1, 0, 2)
             if self.return_intermediate:
-                intermediate.append(output)
-                intermediate_reference_points.append(reference_points)
-
+                intermediate.append(output) # 记录中间预测值输出 (900, 1, 256)
+                intermediate_reference_points.append(reference_points) # 记录参考点 (900, 1, 3)
+        #在6层DetrTransformerDecoderLayer遍历完成后，将6层输出的output和reference_points输出。
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(
                 intermediate_reference_points)
@@ -193,17 +203,17 @@ class CustomMSDeformableAttention(BaseModule):
                 'the dimension of each attention head a power of 2 '
                 'which is more efficient in our CUDA implementation.')
 
-        self.im2col_step = im2col_step
-        self.embed_dims = embed_dims
-        self.num_levels = num_levels
-        self.num_heads = num_heads
-        self.num_points = num_points
+        self.im2col_step = im2col_step #64
+        self.embed_dims = embed_dims #256
+        self.num_levels = num_levels #1
+        self.num_heads = num_heads #8
+        self.num_points = num_points #4
         self.sampling_offsets = nn.Linear(
-            embed_dims, num_heads * num_levels * num_points * 2)
+            embed_dims, num_heads * num_levels * num_points * 2) # 256-->8 * 1 * 4 * 2 = 64
         self.attention_weights = nn.Linear(embed_dims,
                                            num_heads * num_levels * num_points)
-        self.value_proj = nn.Linear(embed_dims, embed_dims)
-        self.output_proj = nn.Linear(embed_dims, embed_dims)
+        self.value_proj = nn.Linear(embed_dims, embed_dims) # 256-->256
+        self.output_proj = nn.Linear(embed_dims, embed_dims) # 256-->256
         self.init_weights()
 
     def init_weights(self):
@@ -277,39 +287,52 @@ class CustomMSDeformableAttention(BaseModule):
         """
 
         if value is None:
-            value = query
+            value = query # (1, 22500, 256)
 
         if identity is None:
-            identity = query
+            identity = query # (1, 900, 256)
         if query_pos is not None:
-            query = query + query_pos
+            query = query + query_pos # (1, 900, 256)
         if not self.batch_first:
             # change to (bs, num_query ,embed_dims)
+            #query:torch.Size([1, 900, 256])
             query = query.permute(1, 0, 2)
+            #value(即bev_embed):torch.Size([1, 50*50, 256])
             value = value.permute(1, 0, 2)
 
-        bs, num_query, _ = query.shape
-        bs, num_value, _ = value.shape
+        bs, num_query, _ = query.shape # (1, 900, _)
+        bs, num_value, _ = value.shape # (1, 22500, _)
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
+        #value(即bev_embed):torch.Size([1, 50*50, 256])
         value = self.value_proj(value)
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
-        value = value.view(bs, num_value, self.num_heads, -1)
+        #value:torch.Size([1, 50*50, 8, 32])，为多头做准备
+        value = value.view(bs, num_value, self.num_heads, -1) # (1, 22500, 8, 32)
 
+        #   (1, 900, 64) --> (1, 900, 8, 1, 4, 2)
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+        
+        # (1, 900, 64) --> (1, 900, 8, 4)  
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
+        
         attention_weights = attention_weights.softmax(-1)
 
+        #attention_weights：torch.Size([1, 900, 8, 1, 4])
         attention_weights = attention_weights.view(bs, num_query,
                                                    self.num_heads,
                                                    self.num_levels,
                                                    self.num_points)
+        #reference_points：torch.Size([1, 900, 1, 2])
         if reference_points.shape[-1] == 2:
+            # [[150, 150]] --> (1, 2)
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            #sampling_locations：torch.Size([1, 900, 8, 1, 4, 2])
+            # (1, 900, 1, 1, 1, 2) + (1, 900, 8, 1, 4, 2) / (1, 1, 1, 1, 1, 2) --> (1, 900, 8, 1, 4, 2)
             sampling_locations = reference_points[:, :, None, :, None, :] \
                 + sampling_offsets \
                 / offset_normalizer[None, None, None, :, None, :]
@@ -333,13 +356,16 @@ class CustomMSDeformableAttention(BaseModule):
                 value, spatial_shapes, level_start_index, sampling_locations,
                 attention_weights, self.im2col_step)
         else:
+            #output：torch.Size([1, 900, 256]) 
+            #可变形注意力机制，利用query从value(bev_embed)中提取有用信息
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)
 
+        #output：torch.Size([1, 900, 256]) 
         output = self.output_proj(output)
 
         if not self.batch_first:
             # (num_query, bs ,embed_dims)
-            output = output.permute(1, 0, 2)
+            output = output.permute(1, 0, 2)# (900, 1, 256)
 
-        return self.dropout(output) + identity
+        return self.dropout(output) + identity# (900, 1, 256)

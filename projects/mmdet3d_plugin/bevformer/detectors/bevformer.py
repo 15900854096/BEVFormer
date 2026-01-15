@@ -66,6 +66,7 @@ class BEVFormer(MVXTwoStageDetector):
 
     def extract_img_feat(self, img, img_metas, len_queue=None):
         """Extract features of images."""
+        #img：torch.size(2,6,3,480,800）
         B = img.size(0)
         if img is not None:
             
@@ -79,27 +80,43 @@ class BEVFormer(MVXTwoStageDetector):
             elif img.dim() == 5 and img.size(0) > 1:
                 B, N, C, H, W = img.size()
                 img = img.reshape(B * N, C, H, W)
+
+            #图像增强的一种手段，利用mask遮挡部分图像，让网络学习目标更多的特征，避免过拟合
             if self.use_grid_mask:
+                #从obtain_history_bev()中进入：
+                #img:torch.size(12,3,480,800) 12=2*6 queue=3-1=2（t-2,t-1时刻两帧用以生成prev_bev）
+                #在obtain_history_bev后，从extract_feat()中进入：
+                #img:torch.size(6,3,480,800) 6 = 6*1 queue=3-2=1（t时刻当前帧和prev_bev生成bev_query）        
                 img = self.grid_mask(img)
 
+            #从obtain_history_bev()中进入：
+            #img_feats:tuple(torch.Size(12,2048,15,25)) 12=2*6:queue=3-1=2,cam_num=6
+            #在obtain_history_bev后，从extract_feat()中进入：
+            #img_feats:tuple(torch.Size(6,2048,15,25)) 12=1*6:queue=3-2=1,cam_num=6
             img_feats = self.img_backbone(img)
             if isinstance(img_feats, dict):
                 img_feats = list(img_feats.values())
         else:
             return None
         if self.with_img_neck:
+            #同理，img_feats:tuple(torch.Size(12,256,15,25))/tuple(torch.Size(6,256,15,25))
             img_feats = self.img_neck(img_feats)
 
         img_feats_reshaped = []
-        for img_feat in img_feats:
+        for img_feat in img_feats: #img_feats：： 【第一个尺度(1,2,6,256,15,25)  第二个尺度(1,2,6,256,30,50)】
             BN, C, H, W = img_feat.size()
+            #获取历史bev pre的时候，len_queue对应历史的帧数
             if len_queue is not None:
-                img_feats_reshaped.append(img_feat.view(int(B/len_queue), len_queue, int(BN / B), C, H, W))
+                #img_feat的形状为:
+                #torch.size(batch_size=B/len_queue=1,len_queue=2,num_cams=6,C=256,H=15,W=25)
+                img_feats_reshaped.append(img_feat.view(int(B/len_queue), len_queue, int(BN / B), C, H, W))  #bs 历史帧数 摄像头数目 C H W
+            #当前时刻，获取鱼眼图像特征
             else:
-                img_feats_reshaped.append(img_feat.view(B, int(BN / B), C, H, W))
+                img_feats_reshaped.append(img_feat.view(B, int(BN / B), C, H, W)) #bs 摄像头数目 C H W
         return img_feats_reshaped
 
     @auto_fp16(apply_to=('img'))
+    #提取图像特征并reshape
     def extract_feat(self, img, img_metas=None, len_queue=None):
         """Extract features from images and points."""
 
@@ -129,7 +146,7 @@ class BEVFormer(MVXTwoStageDetector):
         Returns:
             dict: Losses of each branch.
         """
-
+        #从pts_bbox_head进入下一环节BEVFormerHead（包含encoder、decoder）
         outs = self.pts_bbox_head(
             pts_feats, img_metas, prev_bev)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
@@ -162,15 +179,22 @@ class BEVFormer(MVXTwoStageDetector):
 
         with torch.no_grad():
             prev_bev = None
+            #imgs_queue：torch.size(1,2,6,3,480,800)
             bs, len_queue, num_cams, C, H, W = imgs_queue.shape
+            #imgs_queue：torch.size(2,6,3,480,800）
             imgs_queue = imgs_queue.reshape(bs*len_queue, num_cams, C, H, W)
             img_feats_list = self.extract_feat(img=imgs_queue, len_queue=len_queue)
-            for i in range(len_queue):
+            #img_feats_list：： 【第一个尺度(1,2,6,256,15,25)  第二个尺度(1,2,6,256,30,50)】
+            for i in range(len_queue):#遍历每一个时刻
                 img_metas = [each[i] for each in img_metas_list]
                 if not img_metas[0]['prev_bev_exists']:
                     prev_bev = None
+                
+                # img_feats 按照queue维度进行切片，从6维度降到5维，制作成一个列表
                 # img_feats = self.extract_feat(img=img, img_metas=img_metas)
                 img_feats = [each_scale[:, i] for each_scale in img_feats_list]
+                #利用img_feats和img_metas生成prev_bev
+                ##从pts_bbox_head进入下一环节BEVFormerHead（包含encoder、decoder）
                 prev_bev = self.pts_bbox_head(
                     img_feats, img_metas, prev_bev, only_bev=True)
             self.train()
@@ -214,17 +238,27 @@ class BEVFormer(MVXTwoStageDetector):
             dict: Losses of different branches.
         """
         
+        #img: (bs,queue=3,num_cams=6,C=3,H=480,W=800）
+        #按照queue长度将图像分为pre_img和img
         len_queue = img.size(1)
         prev_img = img[:, :-1, ...]
         img = img[:, -1, ...]
 
+        #利用img_queue中除当前帧之外的前几帧生成BEV_pre
         prev_img_metas = copy.deepcopy(img_metas)
         prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
+
+
 
         img_metas = [each[len_queue-1] for each in img_metas]
         if not img_metas[0]['prev_bev_exists']:
             prev_bev = None
+        #提取当前帧图像特征
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        #obtain_history_bev用于利用t-2、t-1时刻的图像和img_metas生成pre_bev
+        #然后将当前帧图像特征img_feats、obtain_history_bev生成的prev_bev和当前图像帧对应的img_metas
+        #以及bboxes_labels、class_labels输入forward_pts_train计算loss
+        #在forward_pts_train中进入BEVFormerHaed
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,

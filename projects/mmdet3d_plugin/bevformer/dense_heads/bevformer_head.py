@@ -55,8 +55,10 @@ class BEVFormerHead(DETRHead):
         else:
             self.code_weights = [1.0, 1.0, 1.0,
                                  1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
-
+        
+        #定义了bev_query所表征的空间范围
         self.bbox_coder = build_bbox_coder(bbox_coder)
+        #pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]（单位:m）
         self.pc_range = self.bbox_coder.pc_range
         self.real_w = self.pc_range[3] - self.pc_range[0]
         self.real_h = self.pc_range[4] - self.pc_range[1]
@@ -77,7 +79,7 @@ class BEVFormerHead(DETRHead):
         fc_cls = nn.Sequential(*cls_branch)
 
         reg_branch = []
-        for _ in range(self.num_reg_fcs):
+        for _ in range(self.num_reg_fcs): #回归分支有几个线性层
             reg_branch.append(Linear(self.embed_dims, self.embed_dims))
             reg_branch.append(nn.ReLU())
         reg_branch.append(Linear(self.embed_dims, self.code_size))
@@ -104,7 +106,7 @@ class BEVFormerHead(DETRHead):
             self.bev_embedding = nn.Embedding(
                 self.bev_h * self.bev_w, self.embed_dims)
             self.query_embedding = nn.Embedding(self.num_query,
-                                                self.embed_dims * 2)
+                                                self.embed_dims * 2) #embed_dims=256，（900,512）这里之所以要输出512，是为了后续拆分成两半
 
     def init_weights(self):
         """Initialize weights of the DeformDETR head."""
@@ -115,6 +117,7 @@ class BEVFormerHead(DETRHead):
                 nn.init.constant_(m[-1].bias, bias_init)
 
     @auto_fp16(apply_to=('mlvl_feats'))
+    #transformer(encoder+decoder)+后处理reg_branch+cls_branch
     def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False):
         """Forward function.
         Args:
@@ -131,15 +134,24 @@ class BEVFormerHead(DETRHead):
                 head with normalized coordinate format (cx, cy, w, l, cz, h, theta, vx, vy). \
                 Shape [nb_dec, bs, num_query, 9].
         """
+        #mlvl_feats 应该是元组或者列表，每一元素代表一个尺度的特征信息
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
+        #bev_embedding和query_embedding是在_init_layers中定义的
+        #_init_layers仅在BEVFormerHead初始化时进行
+        #即object_query_embeds、bev_queries、bev_pos是可学习的、复用的
+        #object_query_embeds:torch.Size([900,512])
         dtype = mlvl_feats[0].dtype
-        object_query_embeds = self.query_embedding.weight.to(dtype)
+        object_query_embeds = self.query_embedding.weight.to(dtype)#在只获取前面几个时刻的bev时，该变量没有用
+        #bev_queries:torch.Size([50*50,256])
         bev_queries = self.bev_embedding.weight.to(dtype)
 
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
                                device=bev_queries.device).to(dtype)
+        #利用bev_mask生成bev_pos作为bev_queries的位置编码
+        #bev_pos:torch.Size([1, 256, 50, 50]     注:num_feats是128 x坐标128位，y坐标128维，合并就是256维
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
 
+        #给Encoder模块输入了mivl_feats、bev_queries、bev_pos和prev_bev
         if only_bev:  # only use encoder to obtain BEV features, TODO: refine the workaround
             return self.transformer.get_bev_features(
                 mlvl_feats,
@@ -153,32 +165,38 @@ class BEVFormerHead(DETRHead):
                 prev_bev=prev_bev,
             )
         else:
+            #outputs就是object_query_embeds、bev_pos、bev_queries、img_metas和mlvl_feats
+            #输入encoder和decoder模块后的最终输出
+            #outputs:bev_embed, inter_states, init_reference_out, inter_references_out
             outputs = self.transformer(
                 mlvl_feats,
-                bev_queries,
-                object_query_embeds,
+                bev_queries,#编码层需要的query
+                object_query_embeds,#解码层需要的query以及query_pos
                 self.bev_h,
                 self.bev_w,
                 grid_length=(self.real_h / self.bev_h,
                              self.real_w / self.bev_w),
                 bev_pos=bev_pos,
-                reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
-                cls_branches=self.cls_branches if self.as_two_stage else None,
+                reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501 检测头回归分支（每一次解码输出都需要预测，逐层优化loss）
+                cls_branches=self.cls_branches if self.as_two_stage else None,  #检测头分类分支（
                 img_metas=img_metas,
                 prev_bev=prev_bev
         )
 
         bev_embed, hs, init_reference, inter_references = outputs
-        hs = hs.permute(0, 2, 1, 3)
+        hs = hs.permute(0, 2, 1, 3)#(6, 900, 1, 256) ---> (6, 1, 900,256)
         outputs_classes = []
         outputs_coords = []
-        for lvl in range(hs.shape[0]):
+        #这个计算是冗余度，其实在decoder.py里面以及对输出的buffer推理了一遍了，完全可以把那边的结果10个属性全部拿过来，而不是仅仅只拿取参考点
+        for lvl in range(hs.shape[0]): #hs.shape[0]对应的是输出的query的列表长度，如果return_intermediate=true的话，是6组（每经过一次解码层就输出一次），否则就一组
             if lvl == 0:
                 reference = init_reference
             else:
-                reference = inter_references[lvl - 1]
+                reference = inter_references[lvl - 1]#很合理，lvl - 1是因为当前预测的需要对应的参考点不能是当前层输出的900个query经过回归网络的输出，只能当前层的输入
             reference = inverse_sigmoid(reference)
+            #outputs_class：torch.Size([1, 900, 10])
             outputs_class = self.cls_branches[lvl](hs[lvl])
+            #tmp：torch.Size([1, 900, 10])
             tmp = self.reg_branches[lvl](hs[lvl])
 
             # TODO: check the shape of reference
@@ -187,6 +205,8 @@ class BEVFormerHead(DETRHead):
             tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
             tmp[..., 4:5] += reference[..., 2:3]
             tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
+            #下面" *(self.pc_range[3] -self.pc_range[0]) + self.pc_range[0]",
+            #是为了将目标bboxes中心点x、y、z归一化的坐标恢复到实际尺度
             tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
                              self.pc_range[0]) + self.pc_range[0])
             tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
@@ -198,8 +218,9 @@ class BEVFormerHead(DETRHead):
             outputs_coord = tmp
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
-
+        #outputs_classes：torch.Size([6, 1, 900, 10])
         outputs_classes = torch.stack(outputs_classes)
+        #outputs_coords：torch.Size([6, 1, 900, 10])
         outputs_coords = torch.stack(outputs_coords)
 
         outs = {
@@ -209,7 +230,9 @@ class BEVFormerHead(DETRHead):
             'enc_cls_scores': None,
             'enc_bbox_preds': None,
         }
-
+        #outs输出后就可以和class_labels和bboxe_labels一起计算Loss，
+        #然后反向传播梯度，更新模型中的可学习参数：
+        #各个线性层、object_query_embeds、bev_queries、bev_pos等
         return outs
 
     def _get_target_single(self,
@@ -246,6 +269,7 @@ class BEVFormerHead(DETRHead):
         # assigner and sampler
         gt_c = gt_bboxes.shape[-1]
 
+        #父类DETRHead中以及指明了assigner默认是HungarianAssigner
         assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
                                              gt_labels, gt_bboxes_ignore)
 
@@ -255,24 +279,26 @@ class BEVFormerHead(DETRHead):
         neg_inds = sampling_result.neg_inds
 
         # label targets
-        labels = gt_bboxes.new_full((num_bboxes,),
-                                    self.num_classes,
-                                    dtype=torch.long)
+        #生成形状是(num_bboxes,),数值是self.num_classes的tensor, device和gt_bboxes一样，即gt_bboxes只是提供了device信息
+        labels = gt_bboxes.new_full((num_bboxes,),  self.num_classes, dtype=torch.long)
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
-        label_weights = gt_bboxes.new_ones(num_bboxes)
+
+        label_weights = gt_bboxes.new_ones(num_bboxes)#所有的label都会计算loss
 
         # bbox targets
         bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_c]
+        bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+
         bbox_weights = torch.zeros_like(bbox_pred)
-        bbox_weights[pos_inds] = 1.0
+        bbox_weights[pos_inds] = 1.0 #只有配对上的bbox才会计算loss,其实和yolo那些一样
 
         # DETR
-        bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+        # 便于代码理解，被我改动过
         return (labels, label_weights, bbox_targets, bbox_weights,
                 pos_inds, neg_inds)
 
     def get_targets(self,
-                    cls_scores_list,
+                    cls_scores_list,#第一个维度是图像数量，即batchsize
                     bbox_preds_list,
                     gt_bboxes_list,
                     gt_labels_list,
@@ -313,10 +339,12 @@ class BEVFormerHead(DETRHead):
             gt_bboxes_ignore_list for _ in range(num_imgs)
         ]
 
+        # 逐张batchsize计算loss
         (labels_list, label_weights_list, bbox_targets_list,
          bbox_weights_list, pos_inds_list, neg_inds_list) = multi_apply(
             self._get_target_single, cls_scores_list, bbox_preds_list,
             gt_labels_list, gt_bboxes_list, gt_bboxes_ignore_list)
+        
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
         return (labels_list, label_weights_list, bbox_targets_list,
@@ -347,7 +375,7 @@ class BEVFormerHead(DETRHead):
                 a single decoder layer.
         """
         num_imgs = cls_scores.size(0)
-        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
+        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]#tensor的第一个维度拆掉，变成list(如果不换成list,multi_apply就无法拆开了吗？ )
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
         cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
                                            gt_bboxes_list, gt_labels_list,
@@ -430,28 +458,30 @@ class BEVFormerHead(DETRHead):
             f'{self.__class__.__name__} only supports ' \
             f'for gt_bboxes_ignore setting to None.'
 
-        all_cls_scores = preds_dicts['all_cls_scores']
-        all_bbox_preds = preds_dicts['all_bbox_preds']
-        enc_cls_scores = preds_dicts['enc_cls_scores']
-        enc_bbox_preds = preds_dicts['enc_bbox_preds']
+        all_cls_scores = preds_dicts['all_cls_scores'] # (6, 1, 900, 10)
+        all_bbox_preds = preds_dicts['all_bbox_preds'] # (6, 1, 900, 10)
+        enc_cls_scores = preds_dicts['enc_cls_scores'] # None
+        enc_bbox_preds = preds_dicts['enc_bbox_preds'] # None
 
-        num_dec_layers = len(all_cls_scores)
+        num_dec_layers = len(all_cls_scores) #6
         device = gt_labels_list[0].device
 
+        #gravity_center:取边界框几何中心
         gt_bboxes_list = [torch.cat(
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
-            dim=1).to(device) for gt_bboxes in gt_bboxes_list]
+            dim=1).to(device) for gt_bboxes in gt_bboxes_list] # (45, 9) 
 
-        all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
+        all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)] # 复制6份
         all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
         all_gt_bboxes_ignore_list = [
             gt_bboxes_ignore for _ in range(num_dec_layers)
-        ]
+        ] # None
 
+        # 逐层计算loss   all_cls_scores按照tensor的第一个维度拆，list按照每个元素去拿，作为self.loss_single函数的形参
         losses_cls, losses_bbox = multi_apply(
             self.loss_single, all_cls_scores, all_bbox_preds,
             all_gt_bboxes_list, all_gt_labels_list,
-            all_gt_bboxes_ignore_list)
+            all_gt_bboxes_ignore_list) # 6层的分类和回归损失 List[Tensor:6]
 
         loss_dict = dict()
         # loss of proposal generated from encode feature map.
@@ -466,11 +496,11 @@ class BEVFormerHead(DETRHead):
             loss_dict['enc_loss_cls'] = enc_loss_cls
             loss_dict['enc_loss_bbox'] = enc_losses_bbox
 
-        # loss from the last decoder layer
+        # loss from the last decoder layer  记录最后一层的损失
         loss_dict['loss_cls'] = losses_cls[-1]
         loss_dict['loss_bbox'] = losses_bbox[-1]
 
-        # loss from other decoder layers
+        # loss from other decoder layers  记录其他层的损失
         num_dec_layer = 0
         for loss_cls_i, loss_bbox_i in zip(losses_cls[:-1],
                                            losses_bbox[:-1]):

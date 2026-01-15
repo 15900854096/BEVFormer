@@ -96,11 +96,16 @@ class TemporalSelfAttention(BaseModule):
         self.num_heads = num_heads
         self.num_points = num_points
         self.num_bev_queue = num_bev_queue
+        #TSA在初始化阶段定义了下面4个线性映射层，这些参数均在训练中进行学习
+        #利用value生成采样点的offset：256*2——>2*8*1*4*2
         self.sampling_offsets = nn.Linear(
             embed_dims*self.num_bev_queue, num_bev_queue*num_heads * num_levels * num_points * 2)
+        #利用value生成采样点的权重：256*2——>2*8*1*4
         self.attention_weights = nn.Linear(embed_dims*self.num_bev_queue,
                                            num_bev_queue*num_heads * num_levels * num_points)
+        #value的线性映射层
         self.value_proj = nn.Linear(embed_dims, embed_dims)
+        #输出的线性映射层
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.init_weights()
 
@@ -111,6 +116,7 @@ class TemporalSelfAttention(BaseModule):
             self.num_heads,
             dtype=torch.float32) * (2.0 * math.pi / self.num_heads)
         grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
+        #torch.Size([8,1*2,4,2])
         grid_init = (grid_init /
                      grid_init.abs().max(-1, keepdim=True)[0]).view(
             self.num_heads, 1, 1,
@@ -118,7 +124,7 @@ class TemporalSelfAttention(BaseModule):
 
         for i in range(self.num_points):
             grid_init[:, :, i, :] *= i + 1
-
+        #注意sampling_offsets.bias的初始化很有意思，相当于在参考点周围撒了一圈采样点
         self.sampling_offsets.bias.data = grid_init.view(-1)
         constant_init(self.attention_weights, val=0., bias=0.)
         xavier_init(self.value_proj, distribution='uniform', bias=0.)
@@ -173,16 +179,19 @@ class TemporalSelfAttention(BaseModule):
         Returns:
              Tensor: forwarded results with shape [num_query, bs, embed_dims].
         """
-
+        #在没有prev_bev的情况下，将当前时刻的两个bev query进行cat作为value
+        #如果已经有prev_bev，value已在上一模块中生成
         if value is None:
             assert self.batch_first
             bs, len_bev, c = query.shape
             value = torch.stack([query, query], 1).reshape(bs*2, len_bev, c)
 
             # value = torch.cat([query, query], 0)
+        #value not None 的话，value=[prev_bev, bev_query]
 
         if identity is None:
             identity = query
+        #为bev_query添加位置编码
         if query_pos is not None:
             query = query + query_pos
         if not self.batch_first:
@@ -194,16 +203,23 @@ class TemporalSelfAttention(BaseModule):
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
         assert self.num_bev_queue == 2
 
+        #这里在特征维度cat来自于tsa_value[:bs]的prev_bev/bev_query(不含query_pos)和当前的bev_query
+        #并以此推理出offsets和weights
+        #query:torch.Size([1, 50 * 50, 512])
         query = torch.cat([value[:bs], query], -1)
+        #value:torch.Size([2, 50 * 50, 256])
         value = self.value_proj(value)
-
+        #value空白位置填充0，例如prev_bev旋转后部分位置没有特征值
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
 
+        #value:torch.Size([2, 50 * 50, 8, 32])，将256拆分成8*32，为后续多头注意力机制做准备
         value = value.reshape(bs*self.num_bev_queue,
                               num_value, self.num_heads, -1)
 
+        #sampling_offsets：torch.Size([1, 50 * 50, 128])
         sampling_offsets = self.sampling_offsets(query)
+        #sampling_offsets：torch.Size([1，50*50, 8,2,1,4,2]) 8头2时刻4个点xy坐标
         sampling_offsets = sampling_offsets.view(
             bs, num_query, self.num_heads,  self.num_bev_queue, self.num_levels, self.num_points, 2)
         attention_weights = self.attention_weights(query).view(
@@ -215,20 +231,26 @@ class TemporalSelfAttention(BaseModule):
                                                    self.num_bev_queue,
                                                    self.num_levels,
                                                    self.num_points)
-
+        #attention_weights：torch.Size([1*2, 50*50, 8, 1, 4])
+        #bs, num_query, num_heads, num_bev_queue, num_levels, num_points -> bs, num_bev_queue, num_query, num_heads, num_levels, num_points
         attention_weights = attention_weights.permute(0, 3, 1, 2, 4, 5)\
             .reshape(bs*self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points).contiguous()
+        #sampling_offsets：torch.Size([1*2, 50*50, 8, 1, 4, 2])
         sampling_offsets = sampling_offsets.permute(0, 3, 1, 2, 4, 5, 6)\
             .reshape(bs*self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points, 2)
 
-        if reference_points.shape[-1] == 2:
+        # reference_points在TSA中即为hybird_ref_2d：torch.Size([2, 50*50, 1, 2])
+        # 下步为对采样位置进行归一化
+        if reference_points.shape[-1] == 2: #xy
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            #sampling_locations:torch.Size([1*2, 50*50, 8, 1, 4, 2])
+            #reference_points[:, :, None, :, None, :]：：：：2, 50*50, 1, 1, 1, 2
             sampling_locations = reference_points[:, :, None, :, None, :] \
                 + sampling_offsets \
                 / offset_normalizer[None, None, None, :, None, :]
 
-        elif reference_points.shape[-1] == 4:
+        elif reference_points.shape[-1] == 4: #xywh
             sampling_locations = reference_points[:, :, None, :, None, :2] \
                 + sampling_offsets / self.num_points \
                 * reference_points[:, :, None, :, None, 2:] \
@@ -254,7 +276,7 @@ class TemporalSelfAttention(BaseModule):
 
         # output shape (bs*num_bev_queue, num_query, embed_dims)
         # (bs*num_bev_queue, num_query, embed_dims)-> (num_query, embed_dims, bs*num_bev_queue)
-        output = output.permute(1, 2, 0)
+        output = output.permute(1, 2, 0)# torch.Size([1*2, 50*50, 256])->torch.Size([50*50, 256, 1*2])
 
         # fuse history value and current value
         # (num_query, embed_dims, bs*num_bev_queue)-> (num_query, embed_dims, bs, num_bev_queue)
@@ -263,10 +285,80 @@ class TemporalSelfAttention(BaseModule):
 
         # (num_query, embed_dims, bs)-> (bs, num_query, embed_dims)
         output = output.permute(2, 0, 1)
-
+        #output:torch.Size([1, 50*50, 256])
         output = self.output_proj(output)
 
         if not self.batch_first:
             output = output.permute(1, 0, 2)
-
+        #类似于残差连接，dropout可以避免过拟合，相当于在原有bev_query中融入了之前时刻的信息
         return self.dropout(output) + identity
+
+
+#以下全部无意义，只是为了理解某个函数
+if __name__ == '__main__':
+    value=[]
+    sampling_locations=[]
+    spatial_shapes=[]
+    attention_weights=[]
+    F=[]
+    # -------------multi_scale_deformable_attn_pytorch start-------------
+    #value:torch.Size([2, 50 * 50, 8, 32])
+    msda_bs, _, num_heads, msda_embed_dims = value.shape  
+    #sampling_locations:torch.Size([2, 50*50, 8, 1, 4, 2])
+    _, num_queries, num_heads, num_levels, num_points, _ = sampling_locations.shape 
+    #value_list:(torch.Size([2, 50*50, 8, 32]))
+    value_list = value.split([H_ * W_ for H_, W_ in spatial_shapes], dim=1) 
+    # sampling_grids: torch.Size([2, 50*50, 8, 1, 4, 2])
+    sampling_grids = 2 * sampling_locations - 1  # 为了对齐F.grid_sample函数中的grid坐标系范围[-1~1]
+    sampling_value_list = []
+    for level, (H_, W_) in enumerate(spatial_shapes):
+
+        # torch.Size([2, 50*50, 8, 32])-->torch.Size([2, 50*50, 8*32]) -->  torch.Size([2, 8*32, 50*50])  -->torch.Size([2*8, 32, 50, 50])
+        value_l_ = value_list[level].flatten(2).transpose(1, 2).reshape(msda_bs * num_heads, msda_embed_dims, H_, W_)
+        # msda_bs, H_*W_, num_heads, msda_embed_dims ->
+        # msda_bs, H_*W_, num_heads*msda_embed_dims ->
+        # msda_bs, num_heads*msda_embed_dims, H_*W_ ->
+        # msda_bs*num_heads, msda_embed_dims, H_, W_
+        # torch.Size([2*8, 32, 50, 50])
+
+        
+        sampling_grid_l_ = sampling_grids[:, :, :, level].transpose(1, 2).flatten(0, 1)  #[2, 50*50, 8, 4, 2]-->[2, 8, 50*50, 4, 2]-->[2*8, 50*50, 4, 2]
+        # msda_bs, num_queries, num_heads, num_points, 2 ->
+        # msda_bs, num_heads, num_queries, num_points, 2 ->
+        # msda_bs*num_heads, num_queries, num_points, 2
+        # torch.Size([2*8, 50*50, 4, 2])
+
+
+        sampling_value_l_ = F.grid_sample(
+            value_l_,
+            sampling_grid_l_,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False)
+        
+
+        # msda_bs*num_heads, msda_embed_dims, num_queries, num_points
+        # torch.Size([2*8, 32, 50*50, 4])
+        sampling_value_list.append(sampling_value_l_)
+
+    #attention_weights：torch.Size([1*2, 50*50, 8, 1, 4]) ---> torch.Size([1*2, 8, 50*50, 1, 4])  ---> torch.Size([1*2*8, 1, 50*50, 1*4])
+    attention_weights = attention_weights.transpose(1, 2).reshape(msda_bs * num_heads, 1, num_queries, num_levels * num_points)
+    # (msda_bs, num_queries, num_heads, num_levels, num_points) ->
+    # (msda_bs, num_heads, num_queries, num_levels, num_points) ->
+    # (msda_bs*num_heads, 1, num_queries, num_levels*num_points)
+    # torch.Size([2*8, 1, 50*50， 1*4])
+
+    #torch.stack(sampling_value_list, dim=-2)                                            :: torch.Size([2*8, 32, 50*50, 1, 4])
+    #torch.stack(sampling_value_list, dim=-2).flatten(-2)                                :: torch.Size([2*8, 32, 50*50, 1*4])
+    #(torch.stack(sampling_value_list, dim=-2).flatten(-2) * attention_weights)          :: torch.Size([2*8, 32, 50*50, 1*4])
+    #(torch.stack(sampling_value_list, dim=-2).flatten(-2) * attention_weights).sum(-1)  :: torch.Size([2*8, 32, 50*50])
+    #output:: torch.Size([2, 8*32, 50*50])
+    output = (torch.stack(sampling_value_list, dim=-2).flatten(-2) *
+                attention_weights).sum(-1).view(msda_bs, num_heads * msda_embed_dims, num_queries)
+    
+
+    # torch.Size([2, 256, 50*50])
+    # return output.transpose(1, 2).contiguous()
+    output = output.transpose(1, 2).contiguous()
+    # torch.Size([2, 50*50, 256]) # (bs*num_bev_queue, num_query, embed_dims)
+    # --------------multi_scale_deformable_attn_pytorch end--------------

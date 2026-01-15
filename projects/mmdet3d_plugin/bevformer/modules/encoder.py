@@ -81,6 +81,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
             ref_y = ref_y.reshape(-1)[None] / H
             ref_x = ref_x.reshape(-1)[None] / W
             ref_2d = torch.stack((ref_x, ref_y), -1)
+            #ref_2d：torch.Size([1, 50*50, 1, 2])
             ref_2d = ref_2d.repeat(bs, 1, 1).unsqueeze(2)
             return ref_2d
 
@@ -93,54 +94,62 @@ class BEVFormerEncoder(TransformerLayerSequence):
         torch.backends.cudnn.allow_tf32 = False
 
         lidar2img = []
+        #lidar2img相当于相机外参
         for img_meta in img_metas:
             lidar2img.append(img_meta['lidar2img'])
         lidar2img = np.asarray(lidar2img)
         lidar2img = reference_points.new_tensor(lidar2img)  # (B, N, 4, 4)
         reference_points = reference_points.clone()
-
+        # reference_points = ref_3d # normalize 0~1 # torch.Size([1, 4, 50*50, 3])
+        # pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+        # reference_points映射到自车坐标系下, 尺度被缩放为真实尺度
         reference_points[..., 0:1] = reference_points[..., 0:1] * \
             (pc_range[3] - pc_range[0]) + pc_range[0]
         reference_points[..., 1:2] = reference_points[..., 1:2] * \
             (pc_range[4] - pc_range[1]) + pc_range[1]
         reference_points[..., 2:3] = reference_points[..., 2:3] * \
             (pc_range[5] - pc_range[2]) + pc_range[2]
-
+        # 变成齐次坐标  # bs, num_points_in_pillar, bev_h * bev_w, xyz1   将最后一个3变成了4，增加的维度是1，为了做外参乘法
         reference_points = torch.cat(
             (reference_points, torch.ones_like(reference_points[..., :1])), -1)
-
+        # num_points_in_pillar, bs, bev_h * bev_w, xyz1
         reference_points = reference_points.permute(1, 0, 2, 3)
         D, B, num_query = reference_points.size()[:3]
         num_cam = lidar2img.size(1)
-
+        # reference_points：： num_points_in_pillar, bs, num_cam, bev_h * bev_w, xyz1, None
         reference_points = reference_points.view(
-            D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
-
+            D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)#因为有六个相机，所以才这样做  unsqueeze：：用于在指定维度插入一个大小为 1 的新维度，从而改变张量的形状。这在需要调整张量形状以匹配操作要求时非常有用。
+        # lidar2img:: num_points_in_pillar, bs, num_cam, bev_h * bev_w, 4, 4
         lidar2img = lidar2img.view(
             1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
-
-        reference_points_cam = torch.matmul(lidar2img.to(torch.float32),
+        # reference_points_cam:: num_points_in_pillar, bs, num_cam, bev_h * bev_w, xys1
+        reference_points_cam = torch.matmul(lidar2img.to(torch.float32),  #【4,4】*【4,1】=【4,1】  ---->【4】
                                             reference_points.to(torch.float32)).squeeze(-1)
         eps = 1e-5
-
+        # 只保留位于相机前方的点
         bev_mask = (reference_points_cam[..., 2:3] > eps)
+        # 齐次坐标下除以比例系数得到图像平面的坐标真值
+        # num_points_in_pillar, bs, num_cam, bev_h * bev_w, uv
         reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
             reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3]) * eps)
-
+        # 像素坐标归一化
         reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
         reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
-
+        #从相机感受野的角度再删选一次  # bev_mask::  (4, 1, 6, 22500, 1)去除图像外面的点
         bev_mask = (bev_mask & (reference_points_cam[..., 1:2] > 0.0)
                     & (reference_points_cam[..., 1:2] < 1.0)
                     & (reference_points_cam[..., 0:1] < 1.0)
                     & (reference_points_cam[..., 0:1] > 0.0))
         if digit_version(TORCH_VERSION) >= digit_version('1.8'):
-            bev_mask = torch.nan_to_num(bev_mask)
+            bev_mask = torch.nan_to_num(bev_mask)  #nan_to_num::用于将数组或张量中的 NaN、正无穷大 和 负无穷大 替换为指定的有限值
         else:
             bev_mask = bev_mask.new_tensor(
                 np.nan_to_num(bev_mask.cpu().numpy()))
-
+        # num_cam, bs, bev_h * bev_w, num_points_in_pillar, uv
+        # torch.Size([6, 1, 50*50, 4, 2])
         reference_points_cam = reference_points_cam.permute(2, 1, 3, 0, 4)
+        # （ num_points_in_pillar, bs, num_cam, bev_h * bev_w，bool） 
+        # # ->(num_cam, bs, bev_h * bev_w, num_points_in_pillar)（bool）
         bev_mask = bev_mask.permute(2, 1, 3, 0, 4).squeeze(-1)
 
         torch.backends.cuda.matmul.allow_tf32 = allow_tf32
@@ -185,22 +194,31 @@ class BEVFormerEncoder(TransformerLayerSequence):
         output = bev_query
         intermediate = []
 
-        ref_3d = self.get_reference_points(
+        #空间交叉注意力使用，参考点 bev图像坐标系（已归一化）
+        ref_3d = self.get_reference_points(#感觉这里有问题，bev_h,bev_w是图像宽高，self.pc_range[5]-self.pc_range[2]是真实世界高度，不合理，应该设置为self.num_points_in_pillar
             bev_h, bev_w, self.pc_range[5]-self.pc_range[2], self.num_points_in_pillar, dim='3d', bs=bev_query.size(1),  device=bev_query.device, dtype=bev_query.dtype)
+        #时间自注意力使用  bev图像坐标系（已归一化） 当前时刻bev在当前时刻的参考点
         ref_2d = self.get_reference_points(
             bev_h, bev_w, dim='2d', bs=bev_query.size(1), device=bev_query.device, dtype=bev_query.dtype)
 
+        #空间交叉注意力使用，reference_points_cam：参考点 鱼眼图像坐标系（已归一化） bev_mask：参考点落在哪个相机的布尔值矩阵
         reference_points_cam, bev_mask = self.point_sampling(
             ref_3d, self.pc_range, kwargs['img_metas'])
 
         # bug: this code should be 'shift_ref_2d = ref_2d.clone()', we keep this bug for reproducing our results in paper.
         shift_ref_2d = ref_2d.clone()
-        shift_ref_2d += shift[:, None, None, :]
+        #这一步不必要，因为prev_bev和bev已经完成了对齐，prev_bev的ref_2d和bev的ref_2d保持一致就好，地平线结论，我觉得是错的
+        shift_ref_2d += shift[:, None, None, :]#平移变换在这里 #当前时刻bev在前一时刻的参考点
 
         # (num_query, bs, embed_dims) -> (bs, num_query, embed_dims)
+        # torch.Size([50*50, 1, 256]) -> torch.Size([1,50*50,256])
         bev_query = bev_query.permute(1, 0, 2)
+        # torch.Size([50*50,1,256]) -> torch.Size([1,50*50,256])
         bev_pos = bev_pos.permute(1, 0, 2)
+        # bs, bev_h * bev_w, None, xy # torch.Size([1, 50*50, 1, 2])
         bs, len_bev, num_bev_level, _ = ref_2d.shape
+        #当存在prev_bev时，将上一时刻prev_bev和当前时刻bev进行cat作为prev_bev，传入layer中作为value。
+        #否则在layer中将当前时刻的两个bev进行cat作为value。
         if prev_bev is not None:
             prev_bev = prev_bev.permute(1, 0, 2)
             prev_bev = torch.stack(
@@ -211,22 +229,23 @@ class BEVFormerEncoder(TransformerLayerSequence):
             hybird_ref_2d = torch.stack([ref_2d, ref_2d], 1).reshape(
                 bs*2, len_bev, num_bev_level, 2)
 
+        #进入encoder的三层！！！每层包含 ('self_attn', 'norm', 'cross_attn', 'norm', 'ffn', 'norm')
         for lid, layer in enumerate(self.layers):
             output = layer(
                 bev_query,
-                key,
-                value,
+                key, # (6, 920, 1, 256) Flatten的特征图
+                value, # (6, 920, 1, 256) Flatten的特征图
                 *args,
-                bev_pos=bev_pos,
-                ref_2d=hybird_ref_2d,
-                ref_3d=ref_3d,
-                bev_h=bev_h,
-                bev_w=bev_w,
-                spatial_shapes=spatial_shapes,
-                level_start_index=level_start_index,
-                reference_points_cam=reference_points_cam,
-                bev_mask=bev_mask,
-                prev_bev=prev_bev,
+                bev_pos=bev_pos, # (1, 22500, 256)
+                ref_2d=hybird_ref_2d, # (2, 22500, 1, 2)
+                ref_3d=ref_3d, # (1, 4, 22500, 3)
+                bev_h=bev_h, # 150
+                bev_w=bev_w, # 150
+                spatial_shapes=spatial_shapes, # [[23, 40]]
+                level_start_index=level_start_index, # [0]
+                reference_points_cam=reference_points_cam, # (6, 1, 22500, 4, 2)
+                bev_mask=bev_mask, # (6, 1, 22500, 4)
+                prev_bev=prev_bev, # None或(2, 22500, 256)
                 **kwargs)
 
             bev_query = output
@@ -358,19 +377,19 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
             if layer == 'self_attn':
 
                 query = self.attentions[attn_index](
-                    query,
-                    prev_bev,
-                    prev_bev,
+                    query, # (1, 22500, 256)
+                    prev_bev, # None或(2, 22500, 256)
+                    prev_bev, # None或(2, 22500, 256)
                     identity if self.pre_norm else None,
-                    query_pos=bev_pos,
-                    key_pos=bev_pos,
-                    attn_mask=attn_masks[attn_index],
-                    key_padding_mask=query_key_padding_mask,
-                    reference_points=ref_2d,
+                    query_pos=bev_pos,# (1, 22500, 256)
+                    key_pos=bev_pos,# (1, 22500, 256)
+                    attn_mask=attn_masks[attn_index], # None
+                    key_padding_mask=query_key_padding_mask, # None
+                    reference_points=ref_2d, # (2, 22500, 1, 2)
                     spatial_shapes=torch.tensor(
-                        [[bev_h, bev_w]], device=query.device),
+                        [[bev_h, bev_w]], device=query.device), # [[23, 40]]
                     level_start_index=torch.tensor([0], device=query.device),
-                    **kwargs)
+                    **kwargs) # --> (1, 22500, 256)
                 attn_index += 1
                 identity = query
 
@@ -381,22 +400,22 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
             # spaital cross attention
             elif layer == 'cross_attn':
                 query = self.attentions[attn_index](
-                    query,
-                    key,
-                    value,
-                    identity if self.pre_norm else None,
-                    query_pos=query_pos,
-                    key_pos=key_pos,
-                    reference_points=ref_3d,
-                    reference_points_cam=reference_points_cam,
-                    mask=mask,
-                    attn_mask=attn_masks[attn_index],
-                    key_padding_mask=key_padding_mask,
-                    spatial_shapes=spatial_shapes,
-                    level_start_index=level_start_index,
-                    **kwargs)
+                    query, # (1, 22500, 256)
+                    key, # (6, 920, 1, 256)
+                    value, # (6, 920, 1, 256)
+                    identity if self.pre_norm else None, # None
+                    query_pos=query_pos,  # None
+                    key_pos=key_pos,  # None
+                    reference_points=ref_3d, # (1, 4, 22500, 3)
+                    reference_points_cam=reference_points_cam, # (6, 1, 22500, 4, 2)
+                    mask=mask, # None
+                    attn_mask=attn_masks[attn_index], # None
+                    key_padding_mask=key_padding_mask, # None
+                    spatial_shapes=spatial_shapes, # [[23, 40]]
+                    level_start_index=level_start_index, # [0]
+                    **kwargs) # (1, 22500, 256)
                 attn_index += 1
-                identity = query
+                identity = query # (1, 22500, 256)
 
             elif layer == 'ffn':
                 query = self.ffns[ffn_index](

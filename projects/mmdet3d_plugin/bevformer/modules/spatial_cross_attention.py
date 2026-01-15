@@ -74,9 +74,9 @@ class SpatialCrossAttention(BaseModule):
     
     @force_fp32(apply_to=('query', 'key', 'value', 'query_pos', 'reference_points_cam'))
     def forward(self,
-                query,
-                key,
-                value,
+                query, # (1, 22500, 256)
+                key, # (6, 920, 1, 256)
+                value,# (6, 920, 1, 256)
                 residual=None,
                 query_pos=None,
                 key_padding_mask=None,
@@ -119,7 +119,7 @@ class SpatialCrossAttention(BaseModule):
         Returns:
              Tensor: forwarded results with shape [num_query, bs, embed_dims].
         """
-
+        #存在value，value=feat_flatten( torch.Size([6, 15*25, 1, 256]) )
         if key is None:
             key = query
         if value is None:
@@ -128,48 +128,67 @@ class SpatialCrossAttention(BaseModule):
         if residual is None:
             inp_residual = query
             slots = torch.zeros_like(query)
+        #添加位置编码信息
         if query_pos is not None:
             query = query + query_pos
 
         bs, num_query, _ = query.size()
 
-        D = reference_points_cam.size(3)
+        #torch.Size([6, 1, 50*50, 4, 2])
+        D = reference_points_cam.size(3)#Z轴点的数目，这里是4
         indexes = []
+        # bev_mask：torch.Size([6, 1, 50*50, 4])
         for i, mask_per_img in enumerate(bev_mask):
-            index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
+            # 包含的4个点至少有一个可以投影到图像上的pillar在50*50的bev中的索引
+            #mask_per_img :: [1,2500,4]
+            #mask_per_img[0] :: [2500,4]
+            #mask_per_img[0].sum(-1) :: [2500]
+            #mask_per_img[0].sum(-1).nonzero() :: [543,1]
+            #mask_per_img[0].sum(-1).nonzero().squeeze(-1) :: [543]
+            index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)#2500个bev图点上有哪些落在这个图像上（bev柱子上4个点只要有一个在图像上就算）
+            # torch.Size([num_nonzero_pillar]) 
             indexes.append(index_query_per_img)
-        max_len = max([len(each) for each in indexes])
+        max_len = max([len(each) for each in indexes])#bev上的点落在6张图像上（每个图像上能有多少个bev点）的最大数目
 
         # each camera only interacts with its corresponding BEV queries. This step can  greatly save GPU memory.
         queries_rebatch = query.new_zeros(
-            [bs, self.num_cams, max_len, self.embed_dims])
+            [bs, self.num_cams, max_len, self.embed_dims])##query::(1, 22500, 256) 先扩展摄像头维度 (1, 6, 22500, 256)再降22500那个维度(1, 6, max_len, 256)
         reference_points_rebatch = reference_points_cam.new_zeros(
-            [bs, self.num_cams, max_len, D, 2])
+            [bs, self.num_cams, max_len, D, 2])#reference_points_cam::([6, 1, 50*50, 4, 2]) 其实只是降了2500那个维度，其他的维度不变 torch.Size([1, 6, max_len, 4, 2])
         
+        #buffer大小是max_len，有效部分填充具体的东西，无效部分就是0
         for j in range(bs):
-            for i, reference_points_per_img in enumerate(reference_points_cam):   
+            for i, reference_points_per_img in enumerate(reference_points_cam):   #i对应某个相机
                 index_query_per_img = indexes[i]
                 queries_rebatch[j, i, :len(index_query_per_img)] = query[j, index_query_per_img]
                 reference_points_rebatch[j, i, :len(index_query_per_img)] = reference_points_per_img[j, index_query_per_img]
-
+        #key：torch.Size([6, 15*25, 1, 256])
         num_cams, l, bs, embed_dims = key.shape
-
+        #key：torch.Size([6, 15*25, 256])
         key = key.permute(2, 0, 1, 3).reshape(
             bs * self.num_cams, l, self.embed_dims)
         value = value.permute(2, 0, 1, 3).reshape(
             bs * self.num_cams, l, self.embed_dims)
 
+        #query:torch.Size([1,6,max_len,256])->torch.Size([1*6,max_len,256])
+        #key and value:torch.Size([6,15*25,256])
+        #reference_points:torch.Size([6,max_len,4,2])
+        #spatial_shapes：torch.Size([1,2]) {15,25}
+        #level_start_index没有用
         queries = self.deformable_attention(query=queries_rebatch.view(bs*self.num_cams, max_len, self.embed_dims), key=key, value=value,
                                             reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2), spatial_shapes=spatial_shapes,
                                             level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
         for j in range(bs):
             for i, index_query_per_img in enumerate(indexes):
+                # TODO: 不同的相机之间特征向量是直接相加的  slots：：# (1, 22500, 256)  queries：：（1,6，max_len,256)
                 slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)]
 
-        count = bev_mask.sum(-1) > 0
-        count = count.permute(1, 2, 0).sum(-1)
-        count = torch.clamp(count, min=1.0)
-        slots = slots / count[..., None]
+        # bev_mask: torch.Size([6, 1, 50*50, 4]) 高度维度上直接简单求平均
+        # slots: torch.Size([1, 50*50, 256])
+        count = bev_mask.sum(-1) > 0#([6,1,2500])#在4这个维度上并没有相加，只是挑选有效pillar
+        count = count.permute(1, 2, 0).sum(-1)#([1,2500])
+        count = torch.clamp(count, min=1.0)#([1,2500])
+        slots = slots / count[..., None]  #(1, 2500, 256) / (1,2500,1)
         slots = self.output_proj(slots)
 
         return self.dropout(slots) + inp_residual
@@ -245,7 +264,7 @@ class MSDeformableAttention3D(BaseModule):
         self.sampling_offsets = nn.Linear(
             embed_dims, num_heads * num_levels * num_points * 2)
         self.attention_weights = nn.Linear(embed_dims,
-                                           num_heads * num_levels * num_points)
+                                           num_heads * num_levels * num_points)# 256-->64
         self.value_proj = nn.Linear(embed_dims, embed_dims)
 
         self.init_weights()
@@ -272,7 +291,7 @@ class MSDeformableAttention3D(BaseModule):
 
     def forward(self,
                 query,
-                key=None,
+                key=None,#deformable当中key一直是没用的
                 value=None,
                 identity=None,
                 query_pos=None,
@@ -314,62 +333,64 @@ class MSDeformableAttention3D(BaseModule):
         Returns:
              Tensor: forwarded results with shape [num_query, bs, embed_dims].
         """
-
+        ##  徐青  在立柱上的4个点，好像在聚合特征时没有T除掉无效的点（因为4个点不一定全部有效）
         if value is None:
             value = query
         if identity is None:
-            identity = query
+            identity = query # (6, 5439, 256)
         if query_pos is not None:
-            query = query + query_pos
+            query = query + query_pos # (6, 5439, 256)
 
         if not self.batch_first:
             # change to (bs, num_query ,embed_dims)
-            query = query.permute(1, 0, 2)
-            value = value.permute(1, 0, 2)
+            query = query.permute(1, 0, 2) # 6, 5439最大击中次数, 256
+            value = value.permute(1, 0, 2) # 6, 920, 256
 
         bs, num_query, _ = query.shape
         bs, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
-        value = self.value_proj(value)
+        value = self.value_proj(value) # (6, 920, 256)实现一个线性变换
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
-        value = value.view(bs, num_value, self.num_heads, -1)
+        value = value.view(bs, num_value, self.num_heads, -1)# (6, 920, 8, 32)
+        # (6, 5439, 128) --> (6, 5439, 8, 1, 8, 2)这个就是拿的有效的queries_rebatch值做线性变换
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+        # (6, 5439, 64) --> (6, 5439, 8, 8)下面的这几行和TSA是类似的
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
 
-        attention_weights = attention_weights.softmax(-1)
+        attention_weights = attention_weights.softmax(-1) # (6, 5439, 8, 8)
 
         attention_weights = attention_weights.view(bs, num_query,
                                                    self.num_heads,
                                                    self.num_levels,
-                                                   self.num_points)
+                                                   self.num_points)# (6, 5439, 8, 1, 8)
 
-        if reference_points.shape[-1] == 2:
+        if reference_points.shape[-1] == 2:# (6, 5439, 4, 2)相机数，在150*150中有效的pilliar个数，四个 new point pilliar，坐标
             """
             For each BEV query, it owns `num_Z_anchors` in 3D space that having different heights.
             After proejcting, each BEV query has `num_Z_anchors` reference points in each 2D image.
             For each referent point, we sample `num_points` sampling points.
             For `num_Z_anchors` reference points,  it has overall `num_points * num_Z_anchors` sampling points.
             """
-            offset_normalizer = torch.stack(
-                [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1) # [[40, 23]] (1, 2)
 
-            bs, num_query, num_Z_anchors, xy = reference_points.shape
-            reference_points = reference_points[:, :, None, None, None, :, :]
-            sampling_offsets = sampling_offsets / \
-                offset_normalizer[None, None, None, :, None, :]
-            bs, num_query, num_heads, num_levels, num_all_points, xy = sampling_offsets.shape
-            sampling_offsets = sampling_offsets.view(
-                bs, num_query, num_heads, num_levels, num_all_points // num_Z_anchors, num_Z_anchors, xy)
+            bs, num_query, num_Z_anchors, xy = reference_points.shape  # (6, 5439, 4, 2)
+            reference_points = reference_points[:, :, None, None, None, :, :] # (6, 5439, 1, 1, 1, 4, 2)
+            
+            sampling_offsets = sampling_offsets / offset_normalizer[None, None, None, :, None, :] # (6, 5439, 8, 1, 8, 2) / (1, 1, 1, 1, 1, 2)归一化处理
+            bs, num_query, num_heads, num_levels, num_all_points, xy = sampling_offsets.shape# 6, 5439, 8, 1, 8, 2
+            sampling_offsets = sampling_offsets.view(# 一个query在不同高度上产生2个偏移量 8个偏移不是针对一个参考点，是4个参考点，所以要拆分
+                bs, num_query, num_heads, num_levels, num_all_points // num_Z_anchors, num_Z_anchors, xy) # (6, 5439, 8, 1, 2, 4, 2)，num_heads是多头注意力，num_levels
+             # (6, 5439, 1, 1, 1, 4, 2) + (6, 5439, 8, 1, 2, 4, 2) --> (6, 5439, 8, 1, 2, 4, 2)
+            
             sampling_locations = reference_points + sampling_offsets
-            bs, num_query, num_heads, num_levels, num_points, num_Z_anchors, xy = sampling_locations.shape
+            bs, num_query, num_heads, num_levels, num_points, num_Z_anchors, xy = sampling_locations.shape # 6, 5439, 8, 1, 2, 4, 2
             assert num_all_points == num_points * num_Z_anchors
 
-            sampling_locations = sampling_locations.view(
-                bs, num_query, num_heads, num_levels, num_all_points, xy)
+            sampling_locations = sampling_locations.view(bs, num_query, num_heads, num_levels, num_all_points, xy) # (6, 5439, 8, 1, 8, 2) # 合并高度方向参考点
 
         elif reference_points.shape[-1] == 4:
             assert False
@@ -380,7 +401,6 @@ class MSDeformableAttention3D(BaseModule):
 
         #  sampling_locations.shape: bs, num_query, num_heads, num_levels, num_all_points, 2
         #  attention_weights.shape: bs, num_query, num_heads, num_levels, num_all_points
-        #
 
         if torch.cuda.is_available() and value.is_cuda:
             if value.dtype == torch.float16:
@@ -389,8 +409,12 @@ class MSDeformableAttention3D(BaseModule):
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
-                attention_weights, self.im2col_step)
+                attention_weights, self.im2col_step) # (6, 5439, 256)
         else:
+            # value(6, 22500 ,8 ,32),
+            # spatial_shapes(1, 2) 
+            # sampling_locations(6, 5439, 8, 1, 8, 2),
+            # attention_weights(6, 5439, 8, 1, 8)，使用attention_weights完成单元求和，则变成了(6 5439, 8, 1, 32)->然后变成(6, 5439, 256)
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)
         if not self.batch_first:
