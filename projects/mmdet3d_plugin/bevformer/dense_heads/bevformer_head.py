@@ -240,7 +240,7 @@ class BEVFormerHead(DETRHead):
                            bbox_pred,
                            gt_labels,
                            gt_bboxes,
-                           gt_bboxes_ignore=None):
+                           gt_bboxes_ignore=None): #单层单张图片
         """"Compute regression and classification targets for one image.
         Outputs from a single decoder layer of a single feature level are used.
         Args:
@@ -267,7 +267,7 @@ class BEVFormerHead(DETRHead):
 
         num_bboxes = bbox_pred.size(0)
         # assigner and sampler
-        gt_c = gt_bboxes.shape[-1]
+        gt_c = gt_bboxes.shape[-1]#box的属性维度
 
         #父类DETRHead中以及指明了assigner默认是HungarianAssigner
         assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
@@ -275,26 +275,26 @@ class BEVFormerHead(DETRHead):
 
         sampling_result = self.sampler.sample(assign_result, bbox_pred,
                                               gt_bboxes)
-        pos_inds = sampling_result.pos_inds
-        neg_inds = sampling_result.neg_inds
+        pos_inds = sampling_result.pos_inds#900个query当中，pos_inds这些是有GT对应的，即为正样本  注：正样本索引号是pos_indx，对应上的GT索引是sampling_result.pos_assigned_gt_inds
+        neg_inds = sampling_result.neg_inds#负样本
 
         # label targets
-        #生成形状是(num_bboxes,),数值是self.num_classes的tensor, device和gt_bboxes一样，即gt_bboxes只是提供了device信息
+        #生成形状是(num_bboxes,),数值是self.num_classes（代表空集）的tensor, device和gt_bboxes一样，即gt_bboxes只是提供了device信息
         labels = gt_bboxes.new_full((num_bboxes,),  self.num_classes, dtype=torch.long)
-        labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
+        labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]#正样本索引对应的类别标签给打上， pos<--->sampling_result.pos_assigned_gt_inds索引号通过gt_labels取对应顺序的GT标签
 
         label_weights = gt_bboxes.new_ones(num_bboxes)#所有的label都会计算loss
 
         # bbox targets
-        bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_c]
-        bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+        bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_c] #可能存在GT是9个属性，预测的是10个属性，即角度通过cos&sin值预测
+        bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes#正样本索引号是pos_indx，对应上的GT框是sampling_result.pos_gt_bboxes，应该可以通过gt_bboxes[sampling_result.pos_assigned_gt_inds]
 
         bbox_weights = torch.zeros_like(bbox_pred)
         bbox_weights[pos_inds] = 1.0 #只有配对上的bbox才会计算loss,其实和yolo那些一样
 
         # DETR
         # 便于代码理解，被我改动过
-        return (labels, label_weights, bbox_targets, bbox_weights,
+        return (labels, label_weights, bbox_targets, bbox_weights, #这四个行数都是900，其实后两个可以缩减成行数是GT数，类似于yolo，背景不计算回归loss,只有分类loss
                 pos_inds, neg_inds)
 
     def get_targets(self,
@@ -345,8 +345,8 @@ class BEVFormerHead(DETRHead):
             self._get_target_single, cls_scores_list, bbox_preds_list,
             gt_labels_list, gt_bboxes_list, gt_bboxes_ignore_list)
         
-        num_total_pos = sum((inds.numel() for inds in pos_inds_list))
-        num_total_neg = sum((inds.numel() for inds in neg_inds_list))
+        num_total_pos = sum((inds.numel() for inds in pos_inds_list))#所有图片中正样本数量
+        num_total_neg = sum((inds.numel() for inds in neg_inds_list))#所有图片中负样本数量
         return (labels_list, label_weights_list, bbox_targets_list,
                 bbox_weights_list, num_total_pos, num_total_neg)
 
@@ -379,16 +379,16 @@ class BEVFormerHead(DETRHead):
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
         cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
                                            gt_bboxes_list, gt_labels_list,
-                                           gt_bboxes_ignore_list)
+                                           gt_bboxes_ignore_list)#单层，多张图片
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
-        labels = torch.cat(labels_list, 0)
+        labels = torch.cat(labels_list, 0) #不管图片层面，把预测结果对应好的GT类别都cat起来，shape是一维的 labels_list=[一维tensor，一维tensor]
         label_weights = torch.cat(label_weights_list, 0)
-        bbox_targets = torch.cat(bbox_targets_list, 0)
+        bbox_targets = torch.cat(bbox_targets_list, 0)#不管图片层面，把预测结果对应好的GT框都cat起来，shape是二维的 labels_list=[二维tensor，二维tensor]
         bbox_weights = torch.cat(bbox_weights_list, 0)
 
         # classification loss
-        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
+        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)#所有图片的预测结果都拉直了
         # construct weighted avg_factor to match with the official DETR repo
         cls_avg_factor = num_total_pos * 1.0 + \
             num_total_neg * self.bg_cls_weight
@@ -398,7 +398,7 @@ class BEVFormerHead(DETRHead):
 
         cls_avg_factor = max(cls_avg_factor, 1)
         loss_cls = self.loss_cls(
-            cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+            cls_scores, labels, label_weights, avg_factor=cls_avg_factor)#所有图片汇总的类别损失
 
         # Compute the average number of gt boxes accross all gpus, for
         # normalization purposes
@@ -407,9 +407,9 @@ class BEVFormerHead(DETRHead):
 
         # regression L1 loss
         bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
-        normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
-        isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
-        bbox_weights = bbox_weights * self.code_weights
+        normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)#bbox_targets只有9个维度，需转换到10个维度与预测值对应上，pc_range没用
+        isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)  #torch.isfinite检查张量中每个元素是否为有限值,tensor.all(-1)用于沿着最后一个维度，即每行，检查张量中是否所有元素都为True或非零值
+        bbox_weights = bbox_weights * self.code_weights  #code_weights属性值也有权重，vx,vy在loss占比小
 
         loss_bbox = self.loss_bbox(
             bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan,
@@ -466,7 +466,7 @@ class BEVFormerHead(DETRHead):
         num_dec_layers = len(all_cls_scores) #6
         device = gt_labels_list[0].device
 
-        #gravity_center:取边界框几何中心
+        #gravity_center:取边界框几何中心  gt_bboxes原本的前三位是长方体的底面的中心
         gt_bboxes_list = [torch.cat(
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
             dim=1).to(device) for gt_bboxes in gt_bboxes_list] # (45, 9) 
@@ -481,7 +481,7 @@ class BEVFormerHead(DETRHead):
         losses_cls, losses_bbox = multi_apply(
             self.loss_single, all_cls_scores, all_bbox_preds,
             all_gt_bboxes_list, all_gt_labels_list,
-            all_gt_bboxes_ignore_list) # 6层的分类和回归损失 List[Tensor:6]
+            all_gt_bboxes_ignore_list) # 6层的分类和回归损失 losses_cls = List[Tensor((1,)), Tensor((1,)), Tensor((1,)), Tensor((1,)), Tensor((1,)), Tensor((1,))]
 
         loss_dict = dict()
         # loss of proposal generated from encode feature map.
